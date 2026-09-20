@@ -1,0 +1,150 @@
+name: Gerar Video JESUS Gospel
+
+on:
+  workflow_dispatch:
+    inputs:
+      num_videos:
+        description: 'Quantos videos gerar (1 a 5)'
+        required: true
+        default: '1'
+        type: choice
+        options:
+          - '1'
+          - '2'
+          - '3'
+          - '5'
+
+  # Todo dia as 12:00 UTC (09:00 Brasilia)
+  schedule:
+    - cron: '0 12 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  gerar-video:
+    name: Pipeline Video JESUS Gospel
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      # -- 1. Checkout --
+      - name: Checkout do repositorio
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # -- 2. Bypass YouTube: Cloudflare WARP --
+      - name: Instalar Cloudflare WARP
+        run: |
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+          sudo apt-get update -qq
+          sudo apt-get install -y cloudflare-warp
+
+      - name: Conectar ao Cloudflare WARP
+        run: |
+          sudo warp-svc &
+          sleep 8
+          warp-cli --accept-tos registration new || true
+          sleep 5
+          warp-cli --accept-tos connect || true
+          sleep 10
+          warp-cli --accept-tos status || true
+          IP=$(curl -s https://ifconfig.me || true)
+          echo "IP atual (WARP): $IP"
+
+      # -- 3. Bypass YouTube: Deno (JS challenges) --
+      - name: Instalar Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      # -- 4. Python --
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # -- 3. Dependencias do sistema --
+      - name: Instalar FFmpeg e fontes
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg fontconfig
+
+          # Fonte Cinzel (serif elegante para as legendas)
+          sudo mkdir -p /usr/share/fonts/truetype/cinzel
+
+          # Tenta fonte variavel Cinzel primeiro, depois a estatica
+          wget -q -O /tmp/Cinzel-Regular.ttf \
+            "https://raw.githubusercontent.com/google/fonts/main/ofl/cinzel/static/Cinzel-Regular.ttf" \
+          || wget -q -O /tmp/Cinzel-Regular.ttf \
+            "https://github.com/google/fonts/raw/main/ofl/cinzel/Cinzel%5Bwght%5D.ttf"
+
+          sudo cp /tmp/Cinzel-Regular.ttf /usr/share/fonts/truetype/cinzel/Cinzel-Regular.ttf
+          sudo fc-cache -f -v > /dev/null 2>&1
+
+          echo "=== Versoes ==="
+          ffmpeg -version | head -1
+          fc-list | grep -i cinzel && echo "Fonte Cinzel: OK" || echo "Cinzel nao encontrada - usando fallback serif"
+
+      # -- 4. Dependencias Python --
+      - name: Instalar dependencias Python
+        run: |
+          pip install --upgrade pip -q
+          pip install -r requirements.txt -q
+          # yt-dlp sempre na versao mais recente (evita bloqueios)
+          pip install yt-dlp --upgrade -q
+          echo "=== Pacotes instalados ==="
+          pip list | grep -E "faster|yt-dlp|requests|openai"
+
+      # -- 5. Cookies do YouTube (opcional mas recomendado para CI) --
+      - name: Configurar cookies YouTube (se disponivel)
+        run: |
+          if [ -n "$YOUTUBE_COOKIES_B64" ]; then
+            echo "$YOUTUBE_COOKIES_B64" | base64 -d > /tmp/youtube_cookies.txt
+            echo "Cookies YouTube configurados: $(wc -l < /tmp/youtube_cookies.txt) linhas"
+          else
+            echo "YOUTUBE_COOKIES_B64 nao configurado - tentando sem cookies (player client fallback)"
+          fi
+        env:
+          YOUTUBE_COOKIES_B64: ${{ secrets.YOUTUBE_COOKIES_B64 }}
+
+      # -- 6. Pipeline de video --
+      - name: Executar pipeline de video
+        env:
+          PEXELS_API_KEY:          ${{ secrets.PEXELS_API_KEY }}
+          TELEGRAM_BOT_TOKEN:      ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:        ${{ secrets.TELEGRAM_CHAT_ID }}
+          OPENROUTER_API_KEY:      ${{ secrets.OPENROUTER_API_KEY }}
+          YOUTUBE_COOKIES_FILE:    /tmp/youtube_cookies.txt
+          # YouTube desativado ate aprovacao manual (YOUTUBE_ATIVO = False no pipeline.py)
+          # YOUTUBE_CLIENT_ID:     ${{ secrets.YOUTUBE_CLIENT_ID }}
+          # YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          # YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+        run: |
+          NUM_VIDEOS="${{ github.event.inputs.num_videos || '1' }}"
+          echo "Gerando $NUM_VIDEOS video(s) | Modo: so Telegram"
+          python scripts/pipeline.py "$NUM_VIDEOS"
+
+      # -- 7. Salva historicos JSON --
+      - name: Salvar historicos de musicas e clips usados
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add musicas_usadas.json pexels_usados.json || true
+          git diff --cached --quiet && echo "Sem mudancas" || \
+            git commit -m "Atualiza historico musicas/clips [skip ci]"
+          git push || echo "Nada para enviar"
+
+      # -- 7. Upload artefato --
+      - name: Upload video como artefato (backup 7 dias)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: videos-jesus-gospel-${{ github.run_number }}
+          path: output/*.mp4
+          retention-days: 7
+          if-no-files-found: warn
